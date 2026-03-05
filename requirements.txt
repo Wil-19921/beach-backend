@@ -1,4 +1,6 @@
 fastapi
 uvicorn[standard]
 pydantic
+psycopg[binary]
 qrcode[pil]
+pillow
