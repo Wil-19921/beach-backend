@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Literal, Optional, List
-from datetime import datetime, date, timedelta, time
+from datetime import datetime, date, timedelta, time as dtime
 from io import BytesIO
-import sqlite3
 import os
 import hmac
 import hashlib
 import base64
+
+import psycopg
+from psycopg.rows import dict_row
 
 # QR (pip install qrcode[pil])
 import qrcode
@@ -20,7 +22,28 @@ import qrcode
 # Config
 # =========================
 
-DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "beach.db")
+# Render Postgres:
+# - crie um Postgres no Render
+# - copie a "Internal Database URL" para DATABASE_URL no serviço
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Ambiente: development | production
+ENV = (os.environ.get("ENV") or "development").strip().lower()
+
+# ADMIN API KEY (obrigatório em produção)
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
+
+def _require_admin_key_configured():
+    if ENV == "production" and not ADMIN_API_KEY:
+        raise RuntimeError("ADMIN_API_KEY não definido. Em produção isso é obrigatório.")
+
+# CORS (produção deve ser restrito)
+# Ex: CORS_ORIGINS="https://seu-admin.onrender.com,https://seu-app.onrender.com"
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "")
+def _parse_origins(s: str) -> list[str]:
+    origins = [o.strip() for o in (s or "").split(",") if o.strip()]
+    return origins
+
 Status = Literal["awaiting_payment", "paid_with_deposit", "completed", "canceled"]
 PayMethod = Literal["pix", "debit", "credit", "cash", "card"]
 
@@ -34,9 +57,9 @@ TOTAL_KITS = 50
 # Expiração de reserva (minutos)
 RESERVATION_EXPIRATION_MINUTES = 30
 
-# Cancelamento (cliente pediu):
+# Cancelamento:
 # - Retém 30% do calção
-# - Pra reserva com inicio = D, o cliente pode cancelar até (D - 2) às 23:59 (24h antes da retirada, que é D - 1)
+# - Para reserva com inicio = D, cliente pode cancelar até (D - 2) às 23:59 (UTC)
 CANCEL_DEADLINE_DAYS_BEFORE_INICIO = 2
 CANCEL_FEE_DEPOSIT_RATE = 0.30
 
@@ -53,74 +76,86 @@ CODE_PREFIX = "BCH"
 CODE_TOKEN_LEN = 10  # token curto no texto (prefixo do HMAC)
 
 # =========================
-# DB helpers
+# DB helpers (Postgres)
 # =========================
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
 
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
-    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+def _require_db_url():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL não definido. No Render, crie um Postgres e configure DATABASE_URL no serviço."
+        )
+
+def get_conn() -> psycopg.Connection:
+    _require_db_url()
+    # autocommit simplifica (cada statement comita sozinho)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
 
 def init_db() -> None:
     with get_conn() as conn:
+        # tabelas
         conn.execute("""
         CREATE TABLE IF NOT EXISTS kits (
             id INTEGER PRIMARY KEY
-        )
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL
+        );
         """)
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS reservations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kit_id INTEGER NOT NULL,
-            inicio TEXT NOT NULL,
-            fim TEXT NOT NULL,
+            id SERIAL PRIMARY KEY,
+            kit_id INTEGER NOT NULL REFERENCES kits(id),
+
+            inicio DATE NOT NULL,
+            fim DATE NOT NULL,
+
             dias INTEGER NOT NULL,
             cadeiras_extras INTEGER NOT NULL,
-            aluguel_kit REAL NOT NULL,
-            valor_cadeiras_extras REAL NOT NULL,
-            total REAL NOT NULL,
-            caucao REAL NOT NULL,
+
+            aluguel_kit DOUBLE PRECISION NOT NULL,
+            valor_cadeiras_extras DOUBLE PRECISION NOT NULL,
+            total DOUBLE PRECISION NOT NULL,
+            caucao DOUBLE PRECISION NOT NULL,
+
             status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            paid_at TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+
+            paid_at TIMESTAMPTZ,
             pay_method TEXT,
-            FOREIGN KEY (kit_id) REFERENCES kits(id)
-        )
+
+            checked_out_at TIMESTAMPTZ,
+            checked_in_at TIMESTAMPTZ,
+
+            canceled_at TIMESTAMPTZ,
+            cancel_reason TEXT,
+            cancel_fee DOUBLE PRECISION,
+            cancel_fee_type TEXT,
+
+            customer_id INTEGER REFERENCES customers(id),
+            source TEXT
+        );
         """)
 
-        # Clientes
+        # índice útil
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
+        CREATE INDEX IF NOT EXISTS idx_resv_kit_status_dates
+        ON reservations (kit_id, status, inicio, fim);
         """)
 
-        # colunas extras (compatibilidade + regras)
-        ensure_column(conn, "reservations", "checked_out_at", "TEXT")
-        ensure_column(conn, "reservations", "checked_in_at", "TEXT")
-        ensure_column(conn, "reservations", "canceled_at", "TEXT")
-        ensure_column(conn, "reservations", "cancel_reason", "TEXT")
-        ensure_column(conn, "reservations", "cancel_fee", "REAL")
-        ensure_column(conn, "reservations", "cancel_fee_type", "TEXT")
-
-        # venda presencial / cliente
-        ensure_column(conn, "reservations", "customer_id", "INTEGER")
-        ensure_column(conn, "reservations", "source", "TEXT")  # app | store
-
-        cur = conn.execute("SELECT COUNT(*) as c FROM kits")
-        c = cur.fetchone()["c"]
+        # seed kits (1..TOTAL_KITS)
+        cur = conn.execute("SELECT COUNT(*) AS c FROM kits;")
+        c = int(cur.fetchone()["c"])
         if c < TOTAL_KITS:
-            conn.execute("DELETE FROM kits")
+            conn.execute("DELETE FROM kits;")
             conn.executemany(
-                "INSERT INTO kits(id) VALUES (?)",
+                "INSERT INTO kits(id) VALUES (%s);",
                 [(i,) for i in range(1, TOTAL_KITS + 1)]
             )
 
@@ -149,63 +184,55 @@ def calc_preco(dias: int, cadeiras_extras: int) -> tuple[float, float, float]:
     total = aluguel_kit + valor_cadeiras
     return aluguel_kit, valor_cadeiras, total
 
-def overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
-    return not (a_end < b_start or b_end < a_start)
-
-def expire_awaiting_payments(conn: sqlite3.Connection) -> int:
+def expire_awaiting_payments(conn: psycopg.Connection) -> int:
     now = datetime.utcnow()
     threshold = now - timedelta(minutes=RESERVATION_EXPIRATION_MINUTES)
 
     rows = conn.execute(
         """
-        SELECT id, created_at
+        SELECT id
         FROM reservations
         WHERE status = 'awaiting_payment'
-        """
-    ).fetchall()
-
-    to_cancel: List[int] = []
-    for r in rows:
-        try:
-            created = datetime.fromisoformat(r["created_at"])
-        except Exception:
-            continue
-        if created <= threshold:
-            to_cancel.append(int(r["id"]))
-
-    if to_cancel:
-        canceled_at = now.isoformat()
-        conn.executemany(
-            """
-            UPDATE reservations
-            SET status = 'canceled',
-                canceled_at = ?,
-                cancel_reason = COALESCE(cancel_reason, 'expired')
-            WHERE id = ?
-            """,
-            [(canceled_at, rid) for rid in to_cancel]
-        )
-    return len(to_cancel)
-
-def kit_disponivel(conn: sqlite3.Connection, kit_id: int, inicio: str, fim: str) -> bool:
-    rows = conn.execute(
-        """
-        SELECT inicio, fim, status FROM reservations
-        WHERE kit_id = ?
-          AND status != 'canceled'
+          AND created_at <= %s
         """,
-        (kit_id,)
+        (threshold,),
     ).fetchall()
 
-    for r in rows:
-        if overlaps(r["inicio"], r["fim"], inicio, fim):
-            return False
-    return True
+    if not rows:
+        return 0
+
+    ids = [int(r["id"]) for r in rows]
+    conn.execute(
+        """
+        UPDATE reservations
+        SET status = 'canceled',
+            canceled_at = %s,
+            cancel_reason = COALESCE(cancel_reason, 'expired')
+        WHERE id = ANY(%s)
+        """,
+        (now, ids),
+    )
+    return len(ids)
+
+def kit_disponivel(conn: psycopg.Connection, kit_id: int, inicio: date, fim: date) -> bool:
+    # overlap: NOT (existing.fim < inicio OR existing.inicio > fim)
+    r = conn.execute(
+        """
+        SELECT 1
+        FROM reservations
+        WHERE kit_id = %s
+          AND status <> 'canceled'
+          AND NOT (fim < %s OR inicio > %s)
+        LIMIT 1
+        """,
+        (kit_id, inicio, fim),
+    ).fetchone()
+    return r is None
 
 def cancel_deadline_dt(inicio_str: str) -> datetime:
     inicio = parse_date(inicio_str)
     deadline_date = inicio - timedelta(days=CANCEL_DEADLINE_DAYS_BEFORE_INICIO)
-    return datetime.combine(deadline_date, time(23, 59, 59))
+    return datetime.combine(deadline_date, dtime(23, 59, 59))
 
 # =========================
 # Signing / codes
@@ -371,23 +398,63 @@ class AdminWalkInReservationCreate(BaseModel):
 # =========================
 # App
 # =========================
-app = FastAPI(title="Beach Backend", version="0.5.1")
+app = FastAPI(title="Beach Backend", version="0.6.0")
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "beach-backend"}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# CORS:
+# - dev: libera tudo (pra facilitar)
+# - prod: restrinja usando CORS_ORIGINS
+origins = ["*"] if ENV != "production" else _parse_origins(CORS_ORIGINS)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =========================
+# Security middleware
+# =========================
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    path = request.url.path
+
+    # Bloquear swagger/openapi em produção (não expõe docs publicamente)
+    if ENV == "production" and path in ("/docs", "/redoc", "/openapi.json"):
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
+
+    # Proteger tudo que começa com /admin
+    if path.startswith("/admin"):
+        # Em produção, exigir chave configurada
+        if ENV == "production" and not ADMIN_API_KEY:
+            return JSONResponse(status_code=500, content={"detail": "ADMIN_API_KEY não configurado no servidor."})
+
+        # Em dev, se não tiver ADMIN_API_KEY setada, deixa passar (pra você testar local)
+        # Em prod, sempre exige header correto.
+        if ADMIN_API_KEY:
+            provided = request.headers.get("X-Admin-Key")
+            if not provided or not hmac.compare_digest(provided, ADMIN_API_KEY):
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    return await call_next(request)
+
 @app.on_event("startup")
 def on_startup():
+    _require_admin_key_configured()
     init_db()
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "env": ENV}
 
 @app.get("/product", response_model=ProductOut)
 def product():
@@ -425,7 +492,7 @@ def quote(
 @app.get("/kits", response_model=List[KitOut])
 def list_kits():
     with get_conn() as conn:
-        rows = conn.execute("SELECT id FROM kits ORDER BY id").fetchall()
+        rows = conn.execute("SELECT id FROM kits ORDER BY id;").fetchall()
         return [{"id": r["id"]} for r in rows]
 
 @app.get("/availability", response_model=AvailabilityOut)
@@ -433,12 +500,15 @@ def availability(
     inicio: str = Query(..., description="YYYY-MM-DD"),
     fim: str = Query(..., description="YYYY-MM-DD"),
 ):
-    _ = calc_dias(parse_date(inicio), parse_date(fim))
+    di = parse_date(inicio)
+    df = parse_date(fim)
+    _ = calc_dias(di, df)
+
     with get_conn() as conn:
         expire_awaiting_payments(conn)
-        available = []
+        available: List[int] = []
         for kit_id in range(1, TOTAL_KITS + 1):
-            if kit_disponivel(conn, kit_id, inicio, fim):
+            if kit_disponivel(conn, kit_id, di, df):
                 available.append(kit_id)
         return {"inicio": inicio, "fim": fim, "available_kits": available}
 
@@ -452,12 +522,12 @@ def create_reservation(payload: ReservationCreate):
         raise HTTPException(status_code=400, detail="kit_id inválido.")
 
     aluguel_kit, valor_cadeiras, total = calc_preco(dias, payload.cadeiras_extras)
-    created_at = datetime.utcnow().isoformat()
+    created_at = datetime.utcnow()
 
     with get_conn() as conn:
         expire_awaiting_payments(conn)
 
-        if not kit_disponivel(conn, payload.kit_id, payload.inicio, payload.fim):
+        if not kit_disponivel(conn, payload.kit_id, di, df):
             raise HTTPException(status_code=409, detail="Kit indisponível neste período.")
 
         cur = conn.execute(
@@ -465,12 +535,13 @@ def create_reservation(payload: ReservationCreate):
             INSERT INTO reservations
             (kit_id, inicio, fim, dias, cadeiras_extras, aluguel_kit, valor_cadeiras_extras, total, caucao,
              status, created_at, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?, 'app')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'awaiting_payment', %s, 'app')
+            RETURNING id
             """,
             (
                 payload.kit_id,
-                payload.inicio,
-                payload.fim,
+                di,
+                df,
                 dias,
                 payload.cadeiras_extras,
                 aluguel_kit,
@@ -479,40 +550,46 @@ def create_reservation(payload: ReservationCreate):
                 CAUCAO_POR_KIT,
                 created_at,
             )
-        )
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (cur.lastrowid,)).fetchone()
-        return dict(row)
+        ).fetchone()
+
+        rid = int(cur["id"])
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
+        return _row_to_out(row)
 
 @app.post("/reservations/bulk", response_model=BulkReservationOut)
 def create_reservations_bulk(payload: BulkReservationCreate):
-    dias = calc_dias(parse_date(payload.inicio), parse_date(payload.fim))
+    di = parse_date(payload.inicio)
+    df = parse_date(payload.fim)
+    dias = calc_dias(di, df)
+
     with get_conn() as conn:
         expire_awaiting_payments(conn)
 
-        available = []
+        available: List[int] = []
         for kit_id in range(1, TOTAL_KITS + 1):
-            if kit_disponivel(conn, kit_id, payload.inicio, payload.fim):
+            if kit_disponivel(conn, kit_id, di, df):
                 available.append(kit_id)
 
         if len(available) < payload.quantity:
             raise HTTPException(status_code=409, detail=f"Quantidade indisponível. Disponíveis: {len(available)}")
 
         aluguel_kit, valor_cadeiras, total = calc_preco(dias, payload.cadeiras_extras)
-        created_at = datetime.utcnow().isoformat()
+        created_at = datetime.utcnow()
 
         created: List[dict] = []
         for kit_id in available[:payload.quantity]:
-            cur = conn.execute(
+            rid = conn.execute(
                 """
                 INSERT INTO reservations
                 (kit_id, inicio, fim, dias, cadeiras_extras, aluguel_kit, valor_cadeiras_extras, total, caucao,
                  status, created_at, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?, 'app')
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'awaiting_payment', %s, 'app')
+                RETURNING id
                 """,
                 (
                     kit_id,
-                    payload.inicio,
-                    payload.fim,
+                    di,
+                    df,
                     dias,
                     payload.cadeiras_extras,
                     aluguel_kit,
@@ -521,9 +598,10 @@ def create_reservations_bulk(payload: BulkReservationCreate):
                     CAUCAO_POR_KIT,
                     created_at,
                 )
-            )
-            row = conn.execute("SELECT * FROM reservations WHERE id = ?", (cur.lastrowid,)).fetchone()
-            created.append(dict(row))
+            ).fetchone()["id"]
+
+            row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
+            created.append(_row_to_out(row))
 
         return {"reservations": created}
 
@@ -531,89 +609,91 @@ def create_reservations_bulk(payload: BulkReservationCreate):
 def list_reservations():
     with get_conn() as conn:
         expire_awaiting_payments(conn)
-        rows = conn.execute("SELECT * FROM reservations ORDER BY id DESC").fetchall()
-        return [dict(r) for r in rows]
+        rows = conn.execute("SELECT * FROM reservations ORDER BY id DESC;").fetchall()
+        return [_row_to_out(r) for r in rows]
 
 @app.get("/reservations/{reservation_id}", response_model=ReservationOut)
 def get_reservation(reservation_id: int):
     with get_conn() as conn:
         expire_awaiting_payments(conn)
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
-        return dict(row)
+        return _row_to_out(row)
 
 @app.post("/reservations/{reservation_id}/cancel", response_model=CancelOut)
 def cancel_reservation(reservation_id: int, payload: CancelIn):
     now = datetime.utcnow()
+
     with get_conn() as conn:
         expire_awaiting_payments(conn)
 
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
 
+        rowd = _row_to_out(row)
+
         if row["status"] == "canceled":
-            existing = dict(row)
-            fee = float(existing.get("cancel_fee") or 0.0)
-            caucao = float(existing.get("caucao") or 0.0)
+            fee = float(row.get("cancel_fee") or 0.0)
+            caucao = float(row.get("caucao") or 0.0)
             return {
                 "ok": True,
-                "reservation": existing,
+                "reservation": rowd,
                 "fee_retained_from_deposit": fee,
                 "deposit_refund_expected": round(max(0.0, caucao - fee), 2),
-                "rent_refund_expected": float(existing.get("total") or 0.0),
-                "cancel_deadline_utc": cancel_deadline_dt(existing["inicio"]).isoformat(),
+                "rent_refund_expected": float(row.get("total") or 0.0),
+                "cancel_deadline_utc": cancel_deadline_dt(str(rowd["inicio"])).isoformat(),
             }
 
         if row["status"] == "completed":
             raise HTTPException(status_code=400, detail="Reserva já concluída não pode ser cancelada.")
 
-        deadline = cancel_deadline_dt(row["inicio"])
+        deadline = cancel_deadline_dt(str(rowd["inicio"]))
         if now > deadline:
             raise HTTPException(
                 status_code=400,
                 detail=f"Prazo de cancelamento expirou. Deadline (UTC): {deadline.isoformat()}."
             )
 
-        caucao = float(row["caucao"] or 0.0)
+        caucao = float(row.get("caucao") or 0.0)
         fee = round(caucao * CANCEL_FEE_DEPOSIT_RATE, 2)
 
-        canceled_at = now.isoformat()
         reason = (payload.reason or "user_cancel").strip()
 
         conn.execute(
             """
             UPDATE reservations
             SET status='canceled',
-                canceled_at=?,
-                cancel_reason=?,
-                cancel_fee=?,
+                canceled_at=%s,
+                cancel_reason=%s,
+                cancel_fee=%s,
                 cancel_fee_type='deposit_pct'
-            WHERE id=?
+            WHERE id=%s
             """,
-            (canceled_at, reason, fee, reservation_id)
+            (now, reason, fee, reservation_id)
         )
 
-        updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
-        updated_dict = dict(updated)
+        updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
+        upd = _row_to_out(updated)
 
         return {
             "ok": True,
-            "reservation": updated_dict,
+            "reservation": upd,
             "fee_retained_from_deposit": fee,
             "deposit_refund_expected": round(max(0.0, caucao - fee), 2),
-            "rent_refund_expected": round(float(row["total"] or 0.0), 2),
+            "rent_refund_expected": round(float(row.get("total") or 0.0), 2),
             "cancel_deadline_utc": deadline.isoformat(),
         }
 
 @app.post("/payments", response_model=PaymentOut)
 def pay(payload: PaymentCreate):
-    paid_at = datetime.utcnow().isoformat()
+    paid_at = datetime.utcnow()
+
     with get_conn() as conn:
         expire_awaiting_payments(conn)
 
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (payload.reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (payload.reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         if row["status"] == "canceled":
@@ -621,14 +701,14 @@ def pay(payload: PaymentCreate):
         if row["status"] == "paid_with_deposit":
             return {
                 "reservation_id": payload.reservation_id,
-                "method": (row["pay_method"] or payload.method),
-                "deposit_amount": row["caucao"],
-                "paid_at": (row["paid_at"] or paid_at),
+                "method": (row.get("pay_method") or payload.method),
+                "deposit_amount": float(row.get("caucao") or CAUCAO_POR_KIT),
+                "paid_at": (row.get("paid_at") or paid_at).isoformat() if isinstance((row.get("paid_at") or paid_at), datetime) else str(row.get("paid_at") or paid_at),
                 "new_status": "paid_with_deposit",
             }
 
         conn.execute(
-            "UPDATE reservations SET status='paid_with_deposit', paid_at=?, pay_method=? WHERE id=?",
+            "UPDATE reservations SET status='paid_with_deposit', paid_at=%s, pay_method=%s WHERE id=%s;",
             (paid_at, payload.method, payload.reservation_id)
         )
 
@@ -636,7 +716,7 @@ def pay(payload: PaymentCreate):
             "reservation_id": payload.reservation_id,
             "method": payload.method,
             "deposit_amount": CAUCAO_POR_KIT,
-            "paid_at": paid_at,
+            "paid_at": paid_at.isoformat(),
             "new_status": "paid_with_deposit",
         }
 
@@ -647,24 +727,32 @@ def pay(payload: PaymentCreate):
 def reservation_code(reservation_id: int):
     with get_conn() as conn:
         expire_awaiting_payments(conn)
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         if row["status"] != "paid_with_deposit":
             raise HTTPException(status_code=400, detail="Código disponível apenas para reservas pagas.")
-        code = build_code_text(reservation_id, int(row["kit_id"]), row["created_at"])
+
+        created_at = row["created_at"]
+        created_at_str = created_at.isoformat() if isinstance(created_at, datetime) else str(created_at)
+
+        code = build_code_text(reservation_id, int(row["kit_id"]), created_at_str)
         return PlainTextResponse(code)
 
 @app.get("/reservations/{reservation_id}/pickup_qr")
 def pickup_qr(reservation_id: int):
     with get_conn() as conn:
         expire_awaiting_payments(conn)
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         if row["status"] != "paid_with_deposit":
             raise HTTPException(status_code=400, detail="QR disponível apenas para reservas pagas.")
-        code_text = build_code_text(reservation_id, int(row["kit_id"]), row["created_at"])
+
+        created_at = row["created_at"]
+        created_at_str = created_at.isoformat() if isinstance(created_at, datetime) else str(created_at)
+
+        code_text = build_code_text(reservation_id, int(row["kit_id"]), created_at_str)
         img = qrcode.make(code_text)
         buf = BytesIO()
         img.save(buf, format="PNG")
@@ -676,55 +764,58 @@ def pickup_qr(reservation_id: int):
 # =========================
 @app.post("/admin/pickup/scan")
 def admin_scan_pickup(payload: PickupScanIn):
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()
     with get_conn() as conn:
         expire_awaiting_payments(conn)
 
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (payload.reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (payload.reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         if row["status"] != "paid_with_deposit":
             raise HTTPException(status_code=400, detail="Reserva não está paga para retirada.")
 
-        if not verify_pickup_token(payload.reservation_id, row["created_at"], payload.token):
+        created_at = row["created_at"]
+        created_at_str = created_at.isoformat() if isinstance(created_at, datetime) else str(created_at)
+
+        if not verify_pickup_token(payload.reservation_id, created_at_str, payload.token):
             raise HTTPException(status_code=401, detail="QR inválido.")
 
-        if row["checked_out_at"]:
-            updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (payload.reservation_id,)).fetchone()
-            return {"ok": True, "already_checked_out": True, "reservation": dict(updated)}
+        if row.get("checked_out_at"):
+            updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (payload.reservation_id,)).fetchone()
+            return {"ok": True, "already_checked_out": True, "reservation": _row_to_out(updated)}
 
-        conn.execute("UPDATE reservations SET checked_out_at=? WHERE id=?", (now, payload.reservation_id))
-        updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (payload.reservation_id,)).fetchone()
-        return {"ok": True, "reservation": dict(updated)}
+        conn.execute("UPDATE reservations SET checked_out_at=%s WHERE id=%s;", (now, payload.reservation_id))
+        updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (payload.reservation_id,)).fetchone()
+        return {"ok": True, "reservation": _row_to_out(updated)}
 
 # =========================
 # Admin routes (loja)
 # =========================
 @app.get("/admin/reservations", response_model=List[ReservationOut])
 def admin_reservations_by_date(date_str: str = Query(..., alias="date", description="YYYY-MM-DD")):
-    _ = parse_date(date_str)
+    d = parse_date(date_str)
     with get_conn() as conn:
         expire_awaiting_payments(conn)
         rows = conn.execute(
             """
             SELECT * FROM reservations
-            WHERE status != 'canceled'
-              AND inicio <= ?
-              AND fim >= ?
+            WHERE status <> 'canceled'
+              AND inicio <= %s
+              AND fim >= %s
             ORDER BY inicio ASC, id DESC
             """,
-            (date_str, date_str),
+            (d, d),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_row_to_out(r) for r in rows]
 
 @app.post("/admin/scan_code")
 def admin_scan_code(payload: AdminScanCodeIn):
     rid, kit_id, token_prefix = parse_code_text(payload.code)
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()
 
     with get_conn() as conn:
         expire_awaiting_payments(conn)
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (rid,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         if int(row["kit_id"]) != int(kit_id):
@@ -734,28 +825,31 @@ def admin_scan_code(payload: AdminScanCodeIn):
         if row["status"] not in ("paid_with_deposit", "completed"):
             raise HTTPException(status_code=400, detail="Reserva não está paga.")
 
-        if not verify_pickup_token_prefix(rid, row["created_at"], token_prefix):
+        created_at = row["created_at"]
+        created_at_str = created_at.isoformat() if isinstance(created_at, datetime) else str(created_at)
+
+        if not verify_pickup_token_prefix(rid, created_at_str, token_prefix):
             raise HTTPException(status_code=401, detail="Código inválido (token).")
 
-        if row["status"] == "completed" or (row["checked_in_at"] or ""):
-            updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (rid,)).fetchone()
-            return {"ok": True, "action": "none", "message": "Já devolvido.", "reservation": dict(updated)}
+        if row["status"] == "completed" or (row.get("checked_in_at") or None):
+            updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
+            return {"ok": True, "action": "none", "message": "Já devolvido.", "reservation": _row_to_out(updated)}
 
-        if not (row["checked_out_at"] or ""):
-            conn.execute("UPDATE reservations SET checked_out_at=? WHERE id=?", (now, rid))
-            updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (rid,)).fetchone()
-            return {"ok": True, "action": "checkout", "message": "Retirada confirmada ✅", "reservation": dict(updated)}
+        if not (row.get("checked_out_at") or None):
+            conn.execute("UPDATE reservations SET checked_out_at=%s WHERE id=%s;", (now, rid))
+            updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
+            return {"ok": True, "action": "checkout", "message": "Retirada confirmada ✅", "reservation": _row_to_out(updated)}
 
-        conn.execute("UPDATE reservations SET checked_in_at=?, status='completed' WHERE id=?", (now, rid))
-        updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (rid,)).fetchone()
-        return {"ok": True, "action": "checkin", "message": "Devolução confirmada ✅", "reservation": dict(updated)}
+        conn.execute("UPDATE reservations SET checked_in_at=%s, status='completed' WHERE id=%s;", (now, rid))
+        updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
+        return {"ok": True, "action": "checkin", "message": "Devolução confirmada ✅", "reservation": _row_to_out(updated)}
 
 @app.post("/admin/reservations/{reservation_id}/checkout")
 def admin_checkout(reservation_id: int):
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()
     with get_conn() as conn:
         expire_awaiting_payments(conn)
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         if row["status"] == "canceled":
@@ -763,24 +857,24 @@ def admin_checkout(reservation_id: int):
         if row["status"] != "paid_with_deposit":
             raise HTTPException(status_code=400, detail="Somente reservas pagas podem dar checkout.")
 
-        conn.execute("UPDATE reservations SET checked_out_at=? WHERE id=?", (now, reservation_id))
-        updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
-        return {"ok": True, "reservation": dict(updated)}
+        conn.execute("UPDATE reservations SET checked_out_at=%s WHERE id=%s;", (now, reservation_id))
+        updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
+        return {"ok": True, "reservation": _row_to_out(updated)}
 
 @app.post("/admin/reservations/{reservation_id}/checkin")
 def admin_checkin(reservation_id: int):
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()
     with get_conn() as conn:
         expire_awaiting_payments(conn)
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         if row["status"] == "canceled":
             raise HTTPException(status_code=400, detail="Reserva cancelada não pode dar check-in.")
 
-        conn.execute("UPDATE reservations SET checked_in_at=?, status='completed' WHERE id=?", (now, reservation_id))
-        updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
-        return {"ok": True, "reservation": dict(updated)}
+        conn.execute("UPDATE reservations SET checked_in_at=%s, status='completed' WHERE id=%s;", (now, reservation_id))
+        updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
+        return {"ok": True, "reservation": _row_to_out(updated)}
 
 @app.post("/admin/reservations/{reservation_id}/cancel", response_model=AdminCancelOut)
 def admin_cancel_reservation(reservation_id: int, payload: AdminCancelIn):
@@ -788,51 +882,48 @@ def admin_cancel_reservation(reservation_id: int, payload: AdminCancelIn):
     with get_conn() as conn:
         expire_awaiting_payments(conn)
 
-        row = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         if row["status"] == "completed":
             raise HTTPException(status_code=400, detail="Reserva concluída não pode ser cancelada.")
 
         if row["status"] == "canceled":
-            existing = dict(row)
-            fee = float(existing.get("cancel_fee") or 0.0)
-            caucao = float(existing.get("caucao") or 0.0)
+            fee = float(row.get("cancel_fee") or 0.0)
+            caucao = float(row.get("caucao") or 0.0)
             return {
                 "ok": True,
-                "reservation": existing,
+                "reservation": _row_to_out(row),
                 "fee_retained_from_deposit": fee,
                 "deposit_refund_expected": round(max(0.0, caucao - fee), 2),
-                "rent_refund_expected": float(existing.get("total") or 0.0),
+                "rent_refund_expected": float(row.get("total") or 0.0),
             }
 
-        caucao = float(row["caucao"] or 0.0)
+        caucao = float(row.get("caucao") or 0.0)
         fee = round(caucao * CANCEL_FEE_DEPOSIT_RATE, 2)
-        canceled_at = now.isoformat()
         reason = (payload.reason or "admin_cancel_manual").strip()
 
         conn.execute(
             """
             UPDATE reservations
             SET status='canceled',
-                canceled_at=?,
-                cancel_reason=?,
-                cancel_fee=?,
+                canceled_at=%s,
+                cancel_reason=%s,
+                cancel_fee=%s,
                 cancel_fee_type='deposit_pct'
-            WHERE id=?
+            WHERE id=%s
             """,
-            (canceled_at, reason, fee, reservation_id)
+            (now, reason, fee, reservation_id)
         )
 
-        updated = conn.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
-        updated_dict = dict(updated)
+        updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
 
         deposit_refund_expected = max(0.0, caucao - fee)
-        rent_refund_expected = float(row["total"] or 0.0)
+        rent_refund_expected = float(row.get("total") or 0.0)
 
         return {
             "ok": True,
-            "reservation": updated_dict,
+            "reservation": _row_to_out(updated),
             "fee_retained_from_deposit": fee,
             "deposit_refund_expected": round(deposit_refund_expected, 2),
             "rent_refund_expected": round(rent_refund_expected, 2),
@@ -847,7 +938,7 @@ def admin_stats():
             FROM reservations
             GROUP BY status
         """).fetchall()
-        by_status = {r["status"]: r["c"] for r in rows}
+        by_status = {r["status"]: int(r["c"]) for r in rows} if rows else {}
         total = sum(by_status.values()) if by_status else 0
         awaiting = by_status.get("awaiting_payment", 0)
         paid = by_status.get("paid_with_deposit", 0)
@@ -872,7 +963,7 @@ def admin_stats():
 # =========================
 @app.post("/admin/customers", response_model=CustomerOut)
 def admin_create_customer(payload: CustomerCreate):
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()
     name = payload.name.strip()
     phone = payload.phone.strip()
     if not name:
@@ -881,45 +972,55 @@ def admin_create_customer(payload: CustomerCreate):
         raise HTTPException(status_code=400, detail="Telefone obrigatório.")
 
     with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO customers(name, phone, created_at) VALUES (?, ?, ?)",
+        rid = conn.execute(
+            "INSERT INTO customers(name, phone, created_at) VALUES (%s, %s, %s) RETURNING id;",
             (name, phone, now),
-        )
-        row = conn.execute("SELECT * FROM customers WHERE id = ?", (cur.lastrowid,)).fetchone()
-        return dict(row)
+        ).fetchone()["id"]
+
+        row = conn.execute("SELECT * FROM customers WHERE id = %s;", (rid,)).fetchone()
+        row["created_at"] = row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else str(row["created_at"])
+        return row
 
 @app.get("/admin/customers", response_model=List[CustomerOut])
 def admin_search_customers(q: str = Query("", description="busca por nome/telefone")):
     q = (q or "").strip()
     with get_conn() as conn:
         if not q:
-            rows = conn.execute("SELECT * FROM customers ORDER BY id DESC LIMIT 50").fetchall()
+            rows = conn.execute("SELECT * FROM customers ORDER BY id DESC LIMIT 50;").fetchall()
         else:
             like = f"%{q}%"
             rows = conn.execute(
-                "SELECT * FROM customers WHERE name LIKE ? OR phone LIKE ? ORDER BY id DESC LIMIT 50",
+                "SELECT * FROM customers WHERE name ILIKE %s OR phone ILIKE %s ORDER BY id DESC LIMIT 50;",
                 (like, like),
             ).fetchall()
-        return [dict(r) for r in rows]
+
+        out = []
+        for r in rows:
+            rr = dict(r)
+            rr["created_at"] = rr["created_at"].isoformat() if isinstance(rr["created_at"], datetime) else str(rr["created_at"])
+            out.append(rr)
+        return out
 
 # =========================
 # Admin: Venda presencial
 # =========================
 @app.post("/admin/walkin/reservations")
 def admin_create_walkin_reservations(payload: AdminWalkInReservationCreate):
-    dias = calc_dias(parse_date(payload.inicio), parse_date(payload.fim))
-    created_at = datetime.utcnow().isoformat()
+    di = parse_date(payload.inicio)
+    df = parse_date(payload.fim)
+    dias = calc_dias(di, df)
+    created_at = datetime.utcnow()
 
     with get_conn() as conn:
         expire_awaiting_payments(conn)
 
-        cust = conn.execute("SELECT * FROM customers WHERE id = ?", (payload.customer_id,)).fetchone()
+        cust = conn.execute("SELECT * FROM customers WHERE id = %s;", (payload.customer_id,)).fetchone()
         if not cust:
             raise HTTPException(status_code=404, detail="Cliente não encontrado.")
 
-        available = []
+        available: List[int] = []
         for kit_id in range(1, TOTAL_KITS + 1):
-            if kit_disponivel(conn, kit_id, payload.inicio, payload.fim):
+            if kit_disponivel(conn, kit_id, di, df):
                 available.append(kit_id)
 
         if len(available) < payload.quantity:
@@ -929,17 +1030,19 @@ def admin_create_walkin_reservations(payload: AdminWalkInReservationCreate):
 
         created: List[dict] = []
         for kit_id in available[:payload.quantity]:
-            cur = conn.execute(
+            rid = conn.execute(
                 """
                 INSERT INTO reservations
                 (kit_id, inicio, fim, dias, cadeiras_extras, aluguel_kit, valor_cadeiras_extras, total, caucao,
                  status, created_at, paid_at, pay_method, customer_id, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid_with_deposit', ?, ?, ?, ?, 'store')
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        'paid_with_deposit', %s, %s, %s, %s, 'store')
+                RETURNING id
                 """,
                 (
                     kit_id,
-                    payload.inicio,
-                    payload.fim,
+                    di,
+                    df,
                     dias,
                     payload.cadeiras_extras,
                     aluguel_kit,
@@ -951,8 +1054,33 @@ def admin_create_walkin_reservations(payload: AdminWalkInReservationCreate):
                     payload.pay_method,
                     payload.customer_id,
                 ),
-            )
-            row = conn.execute("SELECT * FROM reservations WHERE id = ?", (cur.lastrowid,)).fetchone()
-            created.append(dict(row))
+            ).fetchone()["id"]
+
+            row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
+            created.append(_row_to_out(row))
 
         return {"ok": True, "reservations": created}
+
+# =========================
+# Helpers: row -> response dict
+# =========================
+def _iso(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if isinstance(v, date):
+        return v.isoformat()
+    return str(v)
+
+def _row_to_out(row: dict) -> dict:
+    d = dict(row)
+    # convert dates/timestamps for JSON
+    d["inicio"] = _iso(d.get("inicio"))
+    d["fim"] = _iso(d.get("fim"))
+    d["created_at"] = _iso(d.get("created_at"))
+    d["paid_at"] = _iso(d.get("paid_at"))
+    d["checked_out_at"] = _iso(d.get("checked_out_at"))
+    d["checked_in_at"] = _iso(d.get("checked_in_at"))
+    d["canceled_at"] = _iso(d.get("canceled_at"))
+    return d

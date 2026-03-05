@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 pydantic
 qrcode[pil]
+psycopg[binary]==3.2.6
