@@ -3,5 +3,4 @@ uvicorn[standard]
 pydantic
 qrcode[pil]
 psycopg[binary]
-qrcode[pil]
 pillow
