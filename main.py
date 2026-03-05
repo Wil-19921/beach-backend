@@ -154,9 +154,10 @@ def init_db() -> None:
         c = int(cur.fetchone()["c"])
         if c < TOTAL_KITS:
             conn.execute("DELETE FROM kits;")
-            conn.executemany(
+        with conn.cursor() as cur:
+            cur.executemany(
                 "INSERT INTO kits(id) VALUES (%s);",
-                [(i,) for i in range(1, TOTAL_KITS + 1)]
+                [(i,) for i in range(1, TOTAL_KITS + 1)], 
             )
 
 def parse_date(s: str) -> date:
