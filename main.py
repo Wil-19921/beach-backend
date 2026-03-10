@@ -428,6 +428,9 @@ app.add_middleware(
 async def security_middleware(request: Request, call_next):
     path = request.url.path
 
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     # Bloquear swagger/openapi em produção (não expõe docs publicamente)
     if ENV == "production" and path in ("/docs", "/redoc", "/openapi.json"):
         return JSONResponse(status_code=404, content={"detail": "Not found"})
