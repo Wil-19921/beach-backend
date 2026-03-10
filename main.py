@@ -156,10 +156,9 @@ def init_db() -> None:
             conn.execute("DELETE FROM kits;")
         with conn.cursor() as cur:
             cur.executemany(
-                "INSERT INTO kits(id) VALUES (%s);",
-                [(i,) for i in range(1, TOTAL_KITS + 1)], 
-            )
-
+                "INSERT INTO kits(id) VALUES (%s) ON CONFLICT (id) DO NOTHING;",
+                [(i,) for i in range(1, TOTAL_KITS + 1)],
+)
 def parse_date(s: str) -> date:
     try:
         return date.fromisoformat(s)
