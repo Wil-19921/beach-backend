@@ -15,34 +15,17 @@ import base64
 import psycopg
 from psycopg.rows import dict_row
 
-# QR (pip install qrcode[pil])
 import qrcode
 
 # =========================
 # Config
 # =========================
 
-# Render Postgres:
-# - crie um Postgres no Render
-# - copie a "Internal Database URL" para DATABASE_URL no serviço
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Ambiente: development | production
 ENV = (os.environ.get("ENV") or "development").strip().lower()
-
-# ADMIN API KEY (obrigatório em produção)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
-
-def _require_admin_key_configured():
-    if ENV == "production" and not ADMIN_API_KEY:
-        raise RuntimeError("ADMIN_API_KEY não definido. Em produção isso é obrigatório.")
-
-# CORS (produção deve ser restrito)
-# Ex: CORS_ORIGINS="https://seu-admin.onrender.com,https://seu-app.onrender.com"
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "")
-def _parse_origins(s: str) -> list[str]:
-    origins = [o.strip() for o in (s or "").split(",") if o.strip()]
-    return origins
 
 Status = Literal["awaiting_payment", "paid_with_deposit", "completed", "canceled"]
 PayMethod = Literal["pix", "debit", "credit", "cash", "card"]
@@ -53,27 +36,29 @@ PRECO_CADEIRA_EXTRA_DIA = 10.0
 CAUCAO_POR_KIT = 200.0
 
 TOTAL_KITS = 50
-
-# Expiração de reserva (minutos)
 RESERVATION_EXPIRATION_MINUTES = 30
 
-# Cancelamento:
-# - Retém 30% do calção
-# - Para reserva com inicio = D, cliente pode cancelar até (D - 2) às 23:59 (UTC)
 CANCEL_DEADLINE_DAYS_BEFORE_INICIO = 2
 CANCEL_FEE_DEPOSIT_RATE = 0.30
 
-# Segredo do QR (troque em produção / use variável de ambiente)
 PICKUP_SECRET = os.environ.get("PICKUP_SECRET", "troque-essa-chave-em-producao")
 
-# Kit (descrição exibida no app)
 KIT_NOME = "Kit Praia"
 KIT_ITENS = ["2 cadeiras", "1 guarda-sol", "1 mesa de centro"]
 KIT_DESCRICAO = "Inclui 2 cadeiras, 1 guarda-sol e 1 mesa de centro."
 
-# ✅ Código textual único (o mesmo que vai no QR)
 CODE_PREFIX = "BCH"
-CODE_TOKEN_LEN = 10  # token curto no texto (prefixo do HMAC)
+CODE_TOKEN_LEN = 10
+
+
+def _require_admin_key_configured():
+    if ENV == "production" and not ADMIN_API_KEY:
+        raise RuntimeError("ADMIN_API_KEY não definido. Em produção isso é obrigatório.")
+
+
+def _parse_origins(s: str) -> list[str]:
+    return [o.strip() for o in (s or "").split(",") if o.strip()]
+
 
 # =========================
 # DB helpers (Postgres)
@@ -85,14 +70,14 @@ def _require_db_url():
             "DATABASE_URL não definido. No Render, crie um Postgres e configure DATABASE_URL no serviço."
         )
 
+
 def get_conn() -> psycopg.Connection:
     _require_db_url()
-    # autocommit simplifica (cada statement comita sozinho)
     return psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
+
 
 def init_db() -> None:
     with get_conn() as conn:
-        # tabelas
         conn.execute("""
         CREATE TABLE IF NOT EXISTS kits (
             id INTEGER PRIMARY KEY
@@ -143,33 +128,41 @@ def init_db() -> None:
         );
         """)
 
-        # índice útil
         conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_resv_kit_status_dates
         ON reservations (kit_id, status, inicio, fim);
         """)
 
-        # seed kits (1..TOTAL_KITS)
         cur = conn.execute("SELECT COUNT(*) AS c FROM kits;")
         c = int(cur.fetchone()["c"])
+
         if c < TOTAL_KITS:
             conn.execute("DELETE FROM kits;")
-        with conn.cursor() as cur:
-            cur.executemany(
+
+        with conn.cursor() as cur2:
+            cur2.executemany(
                 "INSERT INTO kits(id) VALUES (%s) ON CONFLICT (id) DO NOTHING;",
                 [(i,) for i in range(1, TOTAL_KITS + 1)],
-)
+            )
+
+
+# =========================
+# Helpers
+# =========================
+
 def parse_date(s: str) -> date:
     try:
         return date.fromisoformat(s)
     except Exception:
         raise HTTPException(status_code=400, detail="Data inválida. Use YYYY-MM-DD.")
 
+
 def calc_dias(inicio: date, fim: date) -> int:
     delta = (fim - inicio).days
     if delta < 0:
         raise HTTPException(status_code=400, detail="fim não pode ser anterior ao início.")
     return delta + 1
+
 
 def calc_preco(dias: int, cadeiras_extras: int) -> tuple[float, float, float]:
     if dias <= 0:
@@ -183,6 +176,7 @@ def calc_preco(dias: int, cadeiras_extras: int) -> tuple[float, float, float]:
     valor_cadeiras = float(cadeiras_extras) * PRECO_CADEIRA_EXTRA_DIA * dias
     total = aluguel_kit + valor_cadeiras
     return aluguel_kit, valor_cadeiras, total
+
 
 def expire_awaiting_payments(conn: psycopg.Connection) -> int:
     now = datetime.utcnow()
@@ -214,8 +208,8 @@ def expire_awaiting_payments(conn: psycopg.Connection) -> int:
     )
     return len(ids)
 
+
 def kit_disponivel(conn: psycopg.Connection, kit_id: int, inicio: date, fim: date) -> bool:
-    # overlap: NOT (existing.fim < inicio OR existing.inicio > fim)
     r = conn.execute(
         """
         SELECT 1
@@ -229,65 +223,82 @@ def kit_disponivel(conn: psycopg.Connection, kit_id: int, inicio: date, fim: dat
     ).fetchone()
     return r is None
 
+
 def cancel_deadline_dt(inicio_str: str) -> datetime:
     inicio = parse_date(inicio_str)
     deadline_date = inicio - timedelta(days=CANCEL_DEADLINE_DAYS_BEFORE_INICIO)
     return datetime.combine(deadline_date, dtime(23, 59, 59))
 
+
 # =========================
 # Signing / codes
 # =========================
+
 def _b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
 
 def sign_pickup_token(reservation_id: int, created_at: str) -> str:
     msg = f"{reservation_id}|{created_at}".encode()
     sig = hmac.new(PICKUP_SECRET.encode(), msg, hashlib.sha256).digest()
     return _b64u(sig)
 
-def verify_pickup_token(reservation_id: int, created_at: str, token: str) -> bool:
-    expected = sign_pickup_token(reservation_id, created_at)
-    return hmac.compare_digest(expected, token)
 
 def verify_pickup_token_prefix(reservation_id: int, created_at: str, token_prefix: str) -> bool:
     expected = sign_pickup_token(reservation_id, created_at)
     return hmac.compare_digest(expected[:len(token_prefix)], token_prefix)
 
+
 def build_code_text(reservation_id: int, kit_id: int, created_at: str) -> str:
     token_prefix = sign_pickup_token(reservation_id, created_at)[:CODE_TOKEN_LEN]
     return f"{CODE_PREFIX}-{reservation_id}-{kit_id}-{token_prefix}"
 
+
 def parse_code_text(code: str) -> tuple[int, int, str]:
     raw = (code or "").strip()
-    parts = raw.split("-")
+
+    # importante: divide só nos 3 primeiros hífens
+    parts = raw.split("-", 3)
+
     if len(parts) != 4 or parts[0] != CODE_PREFIX:
-        raise HTTPException(status_code=400, detail="Código inválido. Formato: BCH-<rid>-<kit>-<token>.")
+        raise HTTPException(
+            status_code=400,
+            detail="Código inválido. Formato: BCH-<rid>-<kit>-<token>."
+        )
+
     try:
         rid = int(parts[1])
         kit = int(parts[2])
     except Exception:
         raise HTTPException(status_code=400, detail="Código inválido: IDs não numéricos.")
+
     token = parts[3].strip()
     if not token:
         raise HTTPException(status_code=400, detail="Código inválido: token vazio.")
+
     return rid, kit, token
+
 
 # =========================
 # Schemas
 # =========================
+
 class KitOut(BaseModel):
     id: int
+
 
 class AvailabilityOut(BaseModel):
     inicio: str
     fim: str
     available_kits: List[int]
 
+
 class ReservationCreate(BaseModel):
     inicio: str = Field(..., description="YYYY-MM-DD")
     fim: str = Field(..., description="YYYY-MM-DD")
     kit_id: int
     cadeiras_extras: int = 0
+
 
 class ReservationOut(BaseModel):
     id: int
@@ -313,9 +324,11 @@ class ReservationOut(BaseModel):
     customer_id: Optional[int] = None
     source: Optional[str] = None
 
+
 class PaymentCreate(BaseModel):
     reservation_id: int
     method: PayMethod
+
 
 class PaymentOut(BaseModel):
     reservation_id: int
@@ -324,11 +337,13 @@ class PaymentOut(BaseModel):
     paid_at: str
     new_status: Status
 
+
 class ProductOut(BaseModel):
     name: str
     description: str
     items: List[str]
     pricing: dict
+
 
 class QuoteOut(BaseModel):
     inicio: str
@@ -340,21 +355,21 @@ class QuoteOut(BaseModel):
     total: float
     caucao: float
 
+
 class BulkReservationCreate(BaseModel):
     inicio: str = Field(..., description="YYYY-MM-DD")
     fim: str = Field(..., description="YYYY-MM-DD")
     quantity: int = Field(..., ge=1, le=TOTAL_KITS)
     cadeiras_extras: int = Field(0, ge=0, description="por kit")
 
+
 class BulkReservationOut(BaseModel):
     reservations: List[ReservationOut]
 
-class PickupScanIn(BaseModel):
-    reservation_id: int
-    token: str
 
 class CancelIn(BaseModel):
     reason: Optional[str] = Field(None, description="Motivo do cancelamento (opcional)")
+
 
 class CancelOut(BaseModel):
     ok: bool
@@ -364,11 +379,14 @@ class CancelOut(BaseModel):
     rent_refund_expected: float
     cancel_deadline_utc: str
 
+
 class AdminScanCodeIn(BaseModel):
     code: str
 
+
 class AdminCancelIn(BaseModel):
     reason: Optional[str] = None
+
 
 class AdminCancelOut(BaseModel):
     ok: bool
@@ -377,15 +395,18 @@ class AdminCancelOut(BaseModel):
     deposit_refund_expected: float
     rent_refund_expected: float
 
+
 class CustomerCreate(BaseModel):
     name: str
     phone: str
+
 
 class CustomerOut(BaseModel):
     id: int
     name: str
     phone: str
     created_at: str
+
 
 class AdminWalkInReservationCreate(BaseModel):
     customer_id: int
@@ -395,22 +416,19 @@ class AdminWalkInReservationCreate(BaseModel):
     cadeiras_extras: int = Field(0, ge=0)
     pay_method: PayMethod = Field(..., description="cash | card | pix | debit | credit")
 
+
 # =========================
 # App
 # =========================
-app = FastAPI(title="Beach Backend", version="0.6.0")
+
+app = FastAPI(title="Beach Backend", version="0.6.1")
+
 
 @app.get("/")
 def root():
     return {"ok": True, "service": "beach-backend"}
 
-@app.get("/health")
-def health():
-    return {"ok": True}
 
-# CORS:
-# - dev: libera tudo (pra facilitar)
-# - prod: restrinja usando CORS_ORIGINS
 origins = ["*"] if ENV != "production" else _parse_origins(CORS_ORIGINS)
 
 app.add_middleware(
@@ -421,9 +439,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# Security middleware
-# =========================
+
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     path = request.url.path
@@ -431,18 +447,13 @@ async def security_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # Bloquear swagger/openapi em produção (não expõe docs publicamente)
     if ENV == "production" and path in ("/docs", "/redoc", "/openapi.json"):
         return JSONResponse(status_code=404, content={"detail": "Not found"})
 
-    # Proteger tudo que começa com /admin
     if path.startswith("/admin"):
-        # Em produção, exigir chave configurada
         if ENV == "production" and not ADMIN_API_KEY:
             return JSONResponse(status_code=500, content={"detail": "ADMIN_API_KEY não configurado no servidor."})
 
-        # Em dev, se não tiver ADMIN_API_KEY setada, deixa passar (pra você testar local)
-        # Em prod, sempre exige header correto.
         if ADMIN_API_KEY:
             provided = request.headers.get("X-Admin-Key")
             if not provided or not hmac.compare_digest(provided, ADMIN_API_KEY):
@@ -450,14 +461,17 @@ async def security_middleware(request: Request, call_next):
 
     return await call_next(request)
 
+
 @app.on_event("startup")
 def on_startup():
     _require_admin_key_configured()
     init_db()
 
+
 @app.get("/health")
 def health():
     return {"ok": True, "env": ENV}
+
 
 @app.get("/product", response_model=ProductOut)
 def product():
@@ -472,6 +486,7 @@ def product():
             "caucao_por_kit": CAUCAO_POR_KIT,
         },
     }
+
 
 @app.get("/quote", response_model=QuoteOut)
 def quote(
@@ -492,11 +507,13 @@ def quote(
         "caucao": CAUCAO_POR_KIT,
     }
 
+
 @app.get("/kits", response_model=List[KitOut])
 def list_kits():
     with get_conn() as conn:
         rows = conn.execute("SELECT id FROM kits ORDER BY id;").fetchall()
         return [{"id": r["id"]} for r in rows]
+
 
 @app.get("/availability", response_model=AvailabilityOut)
 def availability(
@@ -514,6 +531,7 @@ def availability(
             if kit_disponivel(conn, kit_id, di, df):
                 available.append(kit_id)
         return {"inicio": inicio, "fim": fim, "available_kits": available}
+
 
 @app.post("/reservations", response_model=ReservationOut)
 def create_reservation(payload: ReservationCreate):
@@ -558,6 +576,7 @@ def create_reservation(payload: ReservationCreate):
         rid = int(cur["id"])
         row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
         return _row_to_out(row)
+
 
 @app.post("/reservations/bulk", response_model=BulkReservationOut)
 def create_reservations_bulk(payload: BulkReservationCreate):
@@ -608,12 +627,14 @@ def create_reservations_bulk(payload: BulkReservationCreate):
 
         return {"reservations": created}
 
+
 @app.get("/reservations", response_model=List[ReservationOut])
 def list_reservations():
     with get_conn() as conn:
         expire_awaiting_payments(conn)
         rows = conn.execute("SELECT * FROM reservations ORDER BY id DESC;").fetchall()
         return [_row_to_out(r) for r in rows]
+
 
 @app.get("/reservations/{reservation_id}", response_model=ReservationOut)
 def get_reservation(reservation_id: int):
@@ -623,6 +644,7 @@ def get_reservation(reservation_id: int):
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
         return _row_to_out(row)
+
 
 @app.post("/reservations/{reservation_id}/cancel", response_model=CancelOut)
 def cancel_reservation(reservation_id: int, payload: CancelIn):
@@ -661,7 +683,6 @@ def cancel_reservation(reservation_id: int, payload: CancelIn):
 
         caucao = float(row.get("caucao") or 0.0)
         fee = round(caucao * CANCEL_FEE_DEPOSIT_RATE, 2)
-
         reason = (payload.reason or "user_cancel").strip()
 
         conn.execute(
@@ -689,6 +710,7 @@ def cancel_reservation(reservation_id: int, payload: CancelIn):
             "cancel_deadline_utc": deadline.isoformat(),
         }
 
+
 @app.post("/payments", response_model=PaymentOut)
 def pay(payload: PaymentCreate):
     paid_at = datetime.utcnow()
@@ -702,11 +724,12 @@ def pay(payload: PaymentCreate):
         if row["status"] == "canceled":
             raise HTTPException(status_code=400, detail="Reserva expirada/cancelada não pode ser paga.")
         if row["status"] == "paid_with_deposit":
+            current_paid_at = row.get("paid_at") or paid_at
             return {
                 "reservation_id": payload.reservation_id,
                 "method": (row.get("pay_method") or payload.method),
                 "deposit_amount": float(row.get("caucao") or CAUCAO_POR_KIT),
-                "paid_at": (row.get("paid_at") or paid_at).isoformat() if isinstance((row.get("paid_at") or paid_at), datetime) else str(row.get("paid_at") or paid_at),
+                "paid_at": current_paid_at.isoformat() if isinstance(current_paid_at, datetime) else str(current_paid_at),
                 "new_status": "paid_with_deposit",
             }
 
@@ -723,9 +746,11 @@ def pay(payload: PaymentCreate):
             "new_status": "paid_with_deposit",
         }
 
+
 # =========================
-# ✅ Código (texto) + QR
+# Código (texto) + QR
 # =========================
+
 @app.get("/reservations/{reservation_id}/code")
 def reservation_code(reservation_id: int):
     with get_conn() as conn:
@@ -741,6 +766,7 @@ def reservation_code(reservation_id: int):
 
         code = build_code_text(reservation_id, int(row["kit_id"]), created_at_str)
         return PlainTextResponse(code)
+
 
 @app.get("/reservations/{reservation_id}/pickup_qr")
 def pickup_qr(reservation_id: int):
@@ -762,38 +788,11 @@ def pickup_qr(reservation_id: int):
         buf.seek(0)
         return StreamingResponse(buf, media_type="image/png")
 
-# =========================
-# Scan antigo (compat)
-# =========================
-@app.post("/admin/pickup/scan")
-def admin_scan_pickup(payload: PickupScanIn):
-    now = datetime.utcnow()
-    with get_conn() as conn:
-        expire_awaiting_payments(conn)
-
-        row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (payload.reservation_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Reserva não encontrada.")
-        if row["status"] != "paid_with_deposit":
-            raise HTTPException(status_code=400, detail="Reserva não está paga para retirada.")
-
-        created_at = row["created_at"]
-        created_at_str = created_at.isoformat() if isinstance(created_at, datetime) else str(created_at)
-
-        if not verify_pickup_token(payload.reservation_id, created_at_str, payload.token):
-            raise HTTPException(status_code=401, detail="QR inválido.")
-
-        if row.get("checked_out_at"):
-            updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (payload.reservation_id,)).fetchone()
-            return {"ok": True, "already_checked_out": True, "reservation": _row_to_out(updated)}
-
-        conn.execute("UPDATE reservations SET checked_out_at=%s WHERE id=%s;", (now, payload.reservation_id))
-        updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (payload.reservation_id,)).fetchone()
-        return {"ok": True, "reservation": _row_to_out(updated)}
 
 # =========================
-# Admin routes (loja)
+# Admin routes
 # =========================
+
 @app.get("/admin/reservations", response_model=List[ReservationOut])
 def admin_reservations_by_date(date_str: str = Query(..., alias="date", description="YYYY-MM-DD")):
     d = parse_date(date_str)
@@ -811,6 +810,7 @@ def admin_reservations_by_date(date_str: str = Query(..., alias="date", descript
         ).fetchall()
         return [_row_to_out(r) for r in rows]
 
+
 @app.post("/admin/scan_code")
 def admin_scan_code(payload: AdminScanCodeIn):
     rid, kit_id, token_prefix = parse_code_text(payload.code)
@@ -818,13 +818,17 @@ def admin_scan_code(payload: AdminScanCodeIn):
 
     with get_conn() as conn:
         expire_awaiting_payments(conn)
+
         row = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Reserva não encontrada.")
+
         if int(row["kit_id"]) != int(kit_id):
             raise HTTPException(status_code=400, detail="Código não bate com o kit da reserva.")
+
         if row["status"] == "canceled":
             raise HTTPException(status_code=400, detail="Reserva cancelada.")
+
         if row["status"] not in ("paid_with_deposit", "completed"):
             raise HTTPException(status_code=400, detail="Reserva não está paga.")
 
@@ -836,16 +840,32 @@ def admin_scan_code(payload: AdminScanCodeIn):
 
         if row["status"] == "completed" or (row.get("checked_in_at") or None):
             updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
-            return {"ok": True, "action": "none", "message": "Já devolvido.", "reservation": _row_to_out(updated)}
+            return {
+                "ok": True,
+                "action": "none",
+                "message": "Já devolvido.",
+                "reservation": _row_to_out(updated)
+            }
 
         if not (row.get("checked_out_at") or None):
             conn.execute("UPDATE reservations SET checked_out_at=%s WHERE id=%s;", (now, rid))
             updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
-            return {"ok": True, "action": "checkout", "message": "Retirada confirmada ✅", "reservation": _row_to_out(updated)}
+            return {
+                "ok": True,
+                "action": "checkout",
+                "message": "Retirada confirmada ✅",
+                "reservation": _row_to_out(updated)
+            }
 
         conn.execute("UPDATE reservations SET checked_in_at=%s, status='completed' WHERE id=%s;", (now, rid))
         updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (rid,)).fetchone()
-        return {"ok": True, "action": "checkin", "message": "Devolução confirmada ✅", "reservation": _row_to_out(updated)}
+        return {
+            "ok": True,
+            "action": "checkin",
+            "message": "Devolução confirmada ✅",
+            "reservation": _row_to_out(updated)
+        }
+
 
 @app.post("/admin/reservations/{reservation_id}/checkout")
 def admin_checkout(reservation_id: int):
@@ -864,6 +884,7 @@ def admin_checkout(reservation_id: int):
         updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         return {"ok": True, "reservation": _row_to_out(updated)}
 
+
 @app.post("/admin/reservations/{reservation_id}/checkin")
 def admin_checkin(reservation_id: int):
     now = datetime.utcnow()
@@ -878,6 +899,7 @@ def admin_checkin(reservation_id: int):
         conn.execute("UPDATE reservations SET checked_in_at=%s, status='completed' WHERE id=%s;", (now, reservation_id))
         updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
         return {"ok": True, "reservation": _row_to_out(updated)}
+
 
 @app.post("/admin/reservations/{reservation_id}/cancel", response_model=AdminCancelOut)
 def admin_cancel_reservation(reservation_id: int, payload: AdminCancelIn):
@@ -920,7 +942,6 @@ def admin_cancel_reservation(reservation_id: int, payload: AdminCancelIn):
         )
 
         updated = conn.execute("SELECT * FROM reservations WHERE id = %s;", (reservation_id,)).fetchone()
-
         deposit_refund_expected = max(0.0, caucao - fee)
         rent_refund_expected = float(row.get("total") or 0.0)
 
@@ -932,6 +953,7 @@ def admin_cancel_reservation(reservation_id: int, payload: AdminCancelIn):
             "rent_refund_expected": round(rent_refund_expected, 2),
         }
 
+
 @app.get("/admin/stats")
 def admin_stats():
     with get_conn() as conn:
@@ -941,6 +963,7 @@ def admin_stats():
             FROM reservations
             GROUP BY status
         """).fetchall()
+
         by_status = {r["status"]: int(r["c"]) for r in rows} if rows else {}
         total = sum(by_status.values()) if by_status else 0
         awaiting = by_status.get("awaiting_payment", 0)
@@ -949,6 +972,7 @@ def admin_stats():
         canceled = by_status.get("canceled", 0)
         not_completed = total - completed
         open_active = awaiting + paid
+
         return {
             "total": total,
             "by_status": {
@@ -961,14 +985,17 @@ def admin_stats():
             "open_active": open_active,
         }
 
+
 # =========================
 # Admin: Clientes
 # =========================
+
 @app.post("/admin/customers", response_model=CustomerOut)
 def admin_create_customer(payload: CustomerCreate):
     now = datetime.utcnow()
     name = payload.name.strip()
     phone = payload.phone.strip()
+
     if not name:
         raise HTTPException(status_code=400, detail="Nome obrigatório.")
     if not phone:
@@ -981,12 +1008,15 @@ def admin_create_customer(payload: CustomerCreate):
         ).fetchone()["id"]
 
         row = conn.execute("SELECT * FROM customers WHERE id = %s;", (rid,)).fetchone()
-        row["created_at"] = row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else str(row["created_at"])
-        return row
+        out = dict(row)
+        out["created_at"] = _iso(out["created_at"])
+        return out
+
 
 @app.get("/admin/customers", response_model=List[CustomerOut])
 def admin_search_customers(q: str = Query("", description="busca por nome/telefone")):
     q = (q or "").strip()
+
     with get_conn() as conn:
         if not q:
             rows = conn.execute("SELECT * FROM customers ORDER BY id DESC LIMIT 50;").fetchall()
@@ -1000,13 +1030,15 @@ def admin_search_customers(q: str = Query("", description="busca por nome/telefo
         out = []
         for r in rows:
             rr = dict(r)
-            rr["created_at"] = rr["created_at"].isoformat() if isinstance(rr["created_at"], datetime) else str(rr["created_at"])
+            rr["created_at"] = _iso(rr["created_at"])
             out.append(rr)
         return out
+
 
 # =========================
 # Admin: Venda presencial
 # =========================
+
 @app.post("/admin/walkin/reservations")
 def admin_create_walkin_reservations(payload: AdminWalkInReservationCreate):
     di = parse_date(payload.inicio)
@@ -1064,9 +1096,11 @@ def admin_create_walkin_reservations(payload: AdminWalkInReservationCreate):
 
         return {"ok": True, "reservations": created}
 
+
 # =========================
 # Helpers: row -> response dict
 # =========================
+
 def _iso(v):
     if v is None:
         return None
@@ -1076,9 +1110,9 @@ def _iso(v):
         return v.isoformat()
     return str(v)
 
+
 def _row_to_out(row: dict) -> dict:
     d = dict(row)
-    # convert dates/timestamps for JSON
     d["inicio"] = _iso(d.get("inicio"))
     d["fim"] = _iso(d.get("fim"))
     d["created_at"] = _iso(d.get("created_at"))
