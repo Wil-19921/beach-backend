@@ -76,6 +76,93 @@ def get_conn() -> psycopg.Connection:
     return psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
 
 
+def normalize_phone(phone: str) -> str:
+    raw = "".join(ch for ch in (phone or "") if ch.isdigit())
+
+    if not raw:
+        raise HTTPException(status_code=400, detail="Telefone inválido.")
+
+    # Remove +55 se vier com código do país
+    if raw.startswith("55") and len(raw) >= 12:
+        raw = raw[2:]
+
+    if len(raw) < 10 or len(raw) > 11:
+        raise HTTPException(status_code=400, detail="Telefone inválido. Use DDD + número.")
+
+    return raw
+
+
+def _normalize_phone_lenient(phone: str) -> str:
+    raw = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if raw.startswith("55") and len(raw) >= 12:
+        raw = raw[2:]
+    return raw
+
+
+def deduplicate_customers(conn: psycopg.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id, name, phone, created_at FROM customers ORDER BY id ASC;"
+    ).fetchall()
+
+    if not rows:
+        return
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        phone_norm = _normalize_phone_lenient(row.get("phone") or "")
+        if not phone_norm:
+            # Se houver cliente antigo sem telefone válido, ignora por enquanto.
+            continue
+        grouped.setdefault(phone_norm, []).append(dict(row))
+
+    for normalized_phone, items in grouped.items():
+        keeper = items[0]
+        keeper_id = int(keeper["id"])
+
+        # Atualiza telefone do keeper para o valor normalizado
+        conn.execute(
+            "UPDATE customers SET phone = %s WHERE id = %s;",
+            (normalized_phone, keeper_id),
+        )
+
+        # Se houver duplicados, move reservas e exclui os extras
+        for dup in items[1:]:
+            dup_id = int(dup["id"])
+
+            conn.execute(
+                """
+                UPDATE reservations
+                SET customer_id = %s
+                WHERE customer_id = %s;
+                """,
+                (keeper_id, dup_id),
+            )
+
+            dup_name = (dup.get("name") or "").strip()
+            keeper_name = (keeper.get("name") or "").strip()
+
+            if not keeper_name and dup_name:
+                conn.execute(
+                    "UPDATE customers SET name = %s WHERE id = %s;",
+                    (dup_name, keeper_id),
+                )
+                keeper["name"] = dup_name
+
+            conn.execute("DELETE FROM customers WHERE id = %s;", (dup_id,))
+
+    # Normaliza telefones restantes que não tinham duplicado
+    conn.execute(
+        "UPDATE customers SET phone = regexp_replace(phone, '\\D', '', 'g') WHERE phone IS NOT NULL;"
+    )
+    conn.execute(
+        """
+        UPDATE customers
+        SET phone = substring(phone from 3)
+        WHERE phone ~ '^55[0-9]{10,11}$';
+        """
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn:
         conn.execute("""
@@ -128,9 +215,33 @@ def init_db() -> None:
         );
         """)
 
+        # Garante customer_id mesmo se vier de base antiga
+        conn.execute("""
+        ALTER TABLE reservations
+        ADD COLUMN IF NOT EXISTS customer_id INTEGER REFERENCES customers(id);
+        """)
+
+        conn.execute("""
+        ALTER TABLE reservations
+        ADD COLUMN IF NOT EXISTS source TEXT;
+        """)
+
         conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_resv_kit_status_dates
         ON reservations (kit_id, status, inicio, fim);
+        """)
+
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_resv_customer_id
+        ON reservations (customer_id);
+        """)
+
+        # Deduplica e normaliza antes do índice único
+        deduplicate_customers(conn)
+
+        conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_customers_phone
+        ON customers (phone);
         """)
 
         cur = conn.execute("SELECT COUNT(*) AS c FROM kits;")
@@ -230,6 +341,43 @@ def cancel_deadline_dt(inicio_str: str) -> datetime:
     return datetime.combine(deadline_date, dtime(23, 59, 59))
 
 
+def get_or_create_customer(conn: psycopg.Connection, name: str, phone: str) -> int:
+    name = (name or "").strip()
+    phone = normalize_phone(phone)
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Nome do cliente é obrigatório.")
+
+    existing = conn.execute(
+        "SELECT id, name, phone, created_at FROM customers WHERE phone = %s LIMIT 1;",
+        (phone,),
+    ).fetchone()
+
+    if existing:
+        customer_id = int(existing["id"])
+        old_name = (existing.get("name") or "").strip()
+
+        if name and old_name != name:
+            conn.execute(
+                "UPDATE customers SET name = %s WHERE id = %s;",
+                (name, customer_id),
+            )
+
+        return customer_id
+
+    created_at = datetime.utcnow()
+    row = conn.execute(
+        """
+        INSERT INTO customers(name, phone, created_at)
+        VALUES (%s, %s, %s)
+        RETURNING id;
+        """,
+        (name, phone, created_at),
+    ).fetchone()
+
+    return int(row["id"])
+
+
 # =========================
 # Signing / codes
 # =========================
@@ -257,7 +405,6 @@ def build_code_text(reservation_id: int, kit_id: int, created_at: str) -> str:
 def parse_code_text(code: str) -> tuple[int, int, str]:
     raw = (code or "").strip()
 
-    # importante: divide só nos 3 primeiros hífens
     parts = raw.split("-", 3)
 
     if len(parts) != 4 or parts[0] != CODE_PREFIX:
@@ -294,6 +441,7 @@ class AvailabilityOut(BaseModel):
 
 
 class ReservationCreate(BaseModel):
+    customer_id: int
     inicio: str = Field(..., description="YYYY-MM-DD")
     fim: str = Field(..., description="YYYY-MM-DD")
     kit_id: int
@@ -361,6 +509,8 @@ class BulkReservationCreate(BaseModel):
     fim: str = Field(..., description="YYYY-MM-DD")
     quantity: int = Field(..., ge=1, le=TOTAL_KITS)
     cadeiras_extras: int = Field(0, ge=0, description="por kit")
+    customer_name: str = Field(..., min_length=2)
+    customer_phone: str = Field(..., min_length=8)
 
 
 class BulkReservationOut(BaseModel):
@@ -408,6 +558,16 @@ class CustomerOut(BaseModel):
     created_at: str
 
 
+class CustomerLoginIn(BaseModel):
+    name: str
+    phone: str
+
+
+class CustomerLoginOut(BaseModel):
+    customer: CustomerOut
+    is_new: bool
+
+
 class AdminWalkInReservationCreate(BaseModel):
     customer_id: int
     inicio: str
@@ -421,7 +581,7 @@ class AdminWalkInReservationCreate(BaseModel):
 # App
 # =========================
 
-app = FastAPI(title="Beach Backend", version="0.6.1")
+app = FastAPI(title="Beach Backend", version="0.7.0")
 
 
 @app.get("/")
@@ -533,6 +693,112 @@ def availability(
         return {"inicio": inicio, "fim": fim, "available_kits": available}
 
 
+# =========================
+# Cliente público
+# =========================
+
+@app.post("/customer/login", response_model=CustomerLoginOut)
+def customer_login(payload: CustomerLoginIn):
+    name = (payload.name or "").strip()
+    phone = normalize_phone(payload.phone)
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Nome obrigatório.")
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM customers WHERE phone = %s LIMIT 1;",
+            (phone,),
+        ).fetchone()
+
+        if existing:
+            customer_id = int(existing["id"])
+            old_name = (existing.get("name") or "").strip()
+
+            if old_name != name:
+                conn.execute(
+                    "UPDATE customers SET name = %s WHERE id = %s;",
+                    (name, customer_id),
+                )
+                existing = conn.execute(
+                    "SELECT * FROM customers WHERE id = %s;",
+                    (customer_id,),
+                ).fetchone()
+
+            out = dict(existing)
+            out["created_at"] = _iso(out["created_at"])
+            return {
+                "customer": out,
+                "is_new": False,
+            }
+
+        created_at = datetime.utcnow()
+        created = conn.execute(
+            """
+            INSERT INTO customers(name, phone, created_at)
+            VALUES (%s, %s, %s)
+            RETURNING *;
+            """,
+            (name, phone, created_at),
+        ).fetchone()
+
+        out = dict(created)
+        out["created_at"] = _iso(out["created_at"])
+
+        return {
+            "customer": out,
+            "is_new": True,
+        }
+
+
+@app.get("/customer/by-phone/{phone}", response_model=CustomerOut)
+def get_customer_by_phone(phone: str):
+    normalized = normalize_phone(phone)
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM customers WHERE phone = %s LIMIT 1;",
+            (normalized,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Cliente não encontrado.")
+
+        out = dict(row)
+        out["created_at"] = _iso(out["created_at"])
+        return out
+
+
+@app.get("/customer/{customer_id}/reservations", response_model=List[ReservationOut])
+def customer_reservations(customer_id: int):
+    with get_conn() as conn:
+        expire_awaiting_payments(conn)
+
+        cust = conn.execute(
+            "SELECT id FROM customers WHERE id = %s;",
+            (customer_id,),
+        ).fetchone()
+
+        if not cust:
+            raise HTTPException(status_code=404, detail="Cliente não encontrado.")
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM reservations
+            WHERE customer_id = %s
+            ORDER BY created_at DESC, id DESC;
+            """,
+            (customer_id,),
+        ).fetchall()
+
+        return [_row_to_out(r) for r in rows]
+
+
+# =========================
+# Reservas públicas
+# =========================
+
 @app.post("/reservations", response_model=ReservationOut)
 def create_reservation(payload: ReservationCreate):
     di = parse_date(payload.inicio)
@@ -548,6 +814,13 @@ def create_reservation(payload: ReservationCreate):
     with get_conn() as conn:
         expire_awaiting_payments(conn)
 
+        cust = conn.execute(
+            "SELECT id FROM customers WHERE id = %s;",
+            (payload.customer_id,),
+        ).fetchone()
+        if not cust:
+            raise HTTPException(status_code=404, detail="Cliente não encontrado.")
+
         if not kit_disponivel(conn, payload.kit_id, di, df):
             raise HTTPException(status_code=409, detail="Kit indisponível neste período.")
 
@@ -555,8 +828,8 @@ def create_reservation(payload: ReservationCreate):
             """
             INSERT INTO reservations
             (kit_id, inicio, fim, dias, cadeiras_extras, aluguel_kit, valor_cadeiras_extras, total, caucao,
-             status, created_at, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'awaiting_payment', %s, 'app')
+             status, created_at, customer_id, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'awaiting_payment', %s, %s, 'app')
             RETURNING id
             """,
             (
@@ -570,6 +843,7 @@ def create_reservation(payload: ReservationCreate):
                 total,
                 CAUCAO_POR_KIT,
                 created_at,
+                payload.customer_id,
             )
         ).fetchone()
 
@@ -586,6 +860,12 @@ def create_reservations_bulk(payload: BulkReservationCreate):
 
     with get_conn() as conn:
         expire_awaiting_payments(conn)
+
+        customer_id = get_or_create_customer(
+            conn,
+            payload.customer_name,
+            payload.customer_phone,
+        )
 
         available: List[int] = []
         for kit_id in range(1, TOTAL_KITS + 1):
@@ -604,8 +884,8 @@ def create_reservations_bulk(payload: BulkReservationCreate):
                 """
                 INSERT INTO reservations
                 (kit_id, inicio, fim, dias, cadeiras_extras, aluguel_kit, valor_cadeiras_extras, total, caucao,
-                 status, created_at, source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'awaiting_payment', %s, 'app')
+                 status, created_at, customer_id, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'awaiting_payment', %s, %s, 'app')
                 RETURNING id
                 """,
                 (
@@ -619,6 +899,7 @@ def create_reservations_bulk(payload: BulkReservationCreate):
                     total,
                     CAUCAO_POR_KIT,
                     created_at,
+                    customer_id,
                 )
             ).fetchone()["id"]
 
@@ -992,22 +1273,9 @@ def admin_stats():
 
 @app.post("/admin/customers", response_model=CustomerOut)
 def admin_create_customer(payload: CustomerCreate):
-    now = datetime.utcnow()
-    name = payload.name.strip()
-    phone = payload.phone.strip()
-
-    if not name:
-        raise HTTPException(status_code=400, detail="Nome obrigatório.")
-    if not phone:
-        raise HTTPException(status_code=400, detail="Telefone obrigatório.")
-
     with get_conn() as conn:
-        rid = conn.execute(
-            "INSERT INTO customers(name, phone, created_at) VALUES (%s, %s, %s) RETURNING id;",
-            (name, phone, now),
-        ).fetchone()["id"]
-
-        row = conn.execute("SELECT * FROM customers WHERE id = %s;", (rid,)).fetchone()
+        customer_id = get_or_create_customer(conn, payload.name, payload.phone)
+        row = conn.execute("SELECT * FROM customers WHERE id = %s;", (customer_id,)).fetchone()
         out = dict(row)
         out["created_at"] = _iso(out["created_at"])
         return out
