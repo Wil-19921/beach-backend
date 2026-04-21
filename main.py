@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -24,8 +24,10 @@ import qrcode
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 ENV = (os.environ.get("ENV") or "development").strip().lower()
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "")
+
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@beach.com").strip().lower()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "123456")
 
 Status = Literal["awaiting_payment", "paid_with_deposit", "completed", "canceled"]
 PayMethod = Literal["pix", "debit", "credit", "cash", "card"]
@@ -51,13 +53,30 @@ CODE_PREFIX = "BCH"
 CODE_TOKEN_LEN = 10
 
 
-def _require_admin_key_configured():
-    if ENV == "production" and not ADMIN_API_KEY:
-        raise RuntimeError("ADMIN_API_KEY não definido. Em produção isso é obrigatório.")
+def _require_admin_credentials_configured():
+    if ENV == "production":
+        if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+            raise RuntimeError(
+                "ADMIN_EMAIL e ADMIN_PASSWORD devem estar definidos em produção."
+            )
 
 
 def _parse_origins(s: str) -> list[str]:
     return [o.strip() for o in (s or "").split(",") if o.strip()]
+
+
+def require_admin_credentials(
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    if not x_admin_email or not x_admin_password:
+        raise HTTPException(status_code=401, detail="Admin não autenticado.")
+
+    email = x_admin_email.strip().lower()
+    password = x_admin_password
+
+    if email != ADMIN_EMAIL or password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Email ou senha de admin inválidos.")
 
 
 # =========================
@@ -82,7 +101,6 @@ def normalize_phone(phone: str) -> str:
     if not raw:
         raise HTTPException(status_code=400, detail="Telefone inválido.")
 
-    # Remove +55 se vier com código do país
     if raw.startswith("55") and len(raw) >= 12:
         raw = raw[2:]
 
@@ -111,7 +129,6 @@ def deduplicate_customers(conn: psycopg.Connection) -> None:
     for row in rows:
         phone_norm = _normalize_phone_lenient(row.get("phone") or "")
         if not phone_norm:
-            # Se houver cliente antigo sem telefone válido, ignora por enquanto.
             continue
         grouped.setdefault(phone_norm, []).append(dict(row))
 
@@ -119,13 +136,11 @@ def deduplicate_customers(conn: psycopg.Connection) -> None:
         keeper = items[0]
         keeper_id = int(keeper["id"])
 
-        # Atualiza telefone do keeper para o valor normalizado
         conn.execute(
             "UPDATE customers SET phone = %s WHERE id = %s;",
             (normalized_phone, keeper_id),
         )
 
-        # Se houver duplicados, move reservas e exclui os extras
         for dup in items[1:]:
             dup_id = int(dup["id"])
 
@@ -150,7 +165,6 @@ def deduplicate_customers(conn: psycopg.Connection) -> None:
 
             conn.execute("DELETE FROM customers WHERE id = %s;", (dup_id,))
 
-    # Normaliza telefones restantes que não tinham duplicado
     conn.execute(
         "UPDATE customers SET phone = regexp_replace(phone, '\\D', '', 'g') WHERE phone IS NOT NULL;"
     )
@@ -215,7 +229,6 @@ def init_db() -> None:
         );
         """)
 
-        # Garante customer_id mesmo se vier de base antiga
         conn.execute("""
         ALTER TABLE reservations
         ADD COLUMN IF NOT EXISTS customer_id INTEGER REFERENCES customers(id);
@@ -236,7 +249,6 @@ def init_db() -> None:
         ON reservations (customer_id);
         """)
 
-        # Deduplica e normaliza antes do índice único
         deduplicate_customers(conn)
 
         conn.execute("""
@@ -577,11 +589,22 @@ class AdminWalkInReservationCreate(BaseModel):
     pay_method: PayMethod = Field(..., description="cash | card | pix | debit | credit")
 
 
+class AdminLoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class AdminLoginOut(BaseModel):
+    ok: bool
+    email: str
+    message: str
+
+
 # =========================
 # App
 # =========================
 
-app = FastAPI(title="Beach Backend", version="0.7.0")
+app = FastAPI(title="Beach Backend", version="0.8.0")
 
 
 @app.get("/")
@@ -610,21 +633,12 @@ async def security_middleware(request: Request, call_next):
     if ENV == "production" and path in ("/docs", "/redoc", "/openapi.json"):
         return JSONResponse(status_code=404, content={"detail": "Not found"})
 
-    if path.startswith("/admin"):
-        if ENV == "production" and not ADMIN_API_KEY:
-            return JSONResponse(status_code=500, content={"detail": "ADMIN_API_KEY não configurado no servidor."})
-
-        if ADMIN_API_KEY:
-            provided = request.headers.get("X-Admin-Key")
-            if not provided or not hmac.compare_digest(provided, ADMIN_API_KEY):
-                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-
     return await call_next(request)
 
 
 @app.on_event("startup")
 def on_startup():
-    _require_admin_key_configured()
+    _require_admin_credentials_configured()
     init_db()
 
 
@@ -1071,11 +1085,36 @@ def pickup_qr(reservation_id: int):
 
 
 # =========================
+# Admin login
+# =========================
+
+@app.post("/admin/login", response_model=AdminLoginOut)
+def admin_login(payload: AdminLoginIn):
+    email = (payload.email or "").strip().lower()
+    password = payload.password or ""
+
+    if email != ADMIN_EMAIL or password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Email ou senha inválidos.")
+
+    return {
+        "ok": True,
+        "email": email,
+        "message": "Login realizado com sucesso.",
+    }
+
+
+# =========================
 # Admin routes
 # =========================
 
 @app.get("/admin/reservations", response_model=List[ReservationOut])
-def admin_reservations_by_date(date_str: str = Query(..., alias="date", description="YYYY-MM-DD")):
+def admin_reservations_by_date(
+    date_str: str = Query(..., alias="date", description="YYYY-MM-DD"),
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     d = parse_date(date_str)
     with get_conn() as conn:
         expire_awaiting_payments(conn)
@@ -1093,7 +1132,13 @@ def admin_reservations_by_date(date_str: str = Query(..., alias="date", descript
 
 
 @app.post("/admin/scan_code")
-def admin_scan_code(payload: AdminScanCodeIn):
+def admin_scan_code(
+    payload: AdminScanCodeIn,
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     rid, kit_id, token_prefix = parse_code_text(payload.code)
     now = datetime.utcnow()
 
@@ -1149,7 +1194,13 @@ def admin_scan_code(payload: AdminScanCodeIn):
 
 
 @app.post("/admin/reservations/{reservation_id}/checkout")
-def admin_checkout(reservation_id: int):
+def admin_checkout(
+    reservation_id: int,
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     now = datetime.utcnow()
     with get_conn() as conn:
         expire_awaiting_payments(conn)
@@ -1167,7 +1218,13 @@ def admin_checkout(reservation_id: int):
 
 
 @app.post("/admin/reservations/{reservation_id}/checkin")
-def admin_checkin(reservation_id: int):
+def admin_checkin(
+    reservation_id: int,
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     now = datetime.utcnow()
     with get_conn() as conn:
         expire_awaiting_payments(conn)
@@ -1183,7 +1240,14 @@ def admin_checkin(reservation_id: int):
 
 
 @app.post("/admin/reservations/{reservation_id}/cancel", response_model=AdminCancelOut)
-def admin_cancel_reservation(reservation_id: int, payload: AdminCancelIn):
+def admin_cancel_reservation(
+    reservation_id: int,
+    payload: AdminCancelIn,
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     now = datetime.utcnow()
     with get_conn() as conn:
         expire_awaiting_payments(conn)
@@ -1236,7 +1300,12 @@ def admin_cancel_reservation(reservation_id: int, payload: AdminCancelIn):
 
 
 @app.get("/admin/stats")
-def admin_stats():
+def admin_stats(
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     with get_conn() as conn:
         expire_awaiting_payments(conn)
         rows = conn.execute("""
@@ -1272,7 +1341,13 @@ def admin_stats():
 # =========================
 
 @app.post("/admin/customers", response_model=CustomerOut)
-def admin_create_customer(payload: CustomerCreate):
+def admin_create_customer(
+    payload: CustomerCreate,
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     with get_conn() as conn:
         customer_id = get_or_create_customer(conn, payload.name, payload.phone)
         row = conn.execute("SELECT * FROM customers WHERE id = %s;", (customer_id,)).fetchone()
@@ -1282,7 +1357,13 @@ def admin_create_customer(payload: CustomerCreate):
 
 
 @app.get("/admin/customers", response_model=List[CustomerOut])
-def admin_search_customers(q: str = Query("", description="busca por nome/telefone")):
+def admin_search_customers(
+    q: str = Query("", description="busca por nome/telefone"),
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     q = (q or "").strip()
 
     with get_conn() as conn:
@@ -1308,7 +1389,13 @@ def admin_search_customers(q: str = Query("", description="busca por nome/telefo
 # =========================
 
 @app.post("/admin/walkin/reservations")
-def admin_create_walkin_reservations(payload: AdminWalkInReservationCreate):
+def admin_create_walkin_reservations(
+    payload: AdminWalkInReservationCreate,
+    x_admin_email: str | None = Header(default=None),
+    x_admin_password: str | None = Header(default=None),
+):
+    require_admin_credentials(x_admin_email, x_admin_password)
+
     di = parse_date(payload.inicio)
     df = parse_date(payload.fim)
     dias = calc_dias(di, df)
